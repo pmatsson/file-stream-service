@@ -11,13 +11,28 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 )
+
+type FileInfo struct {
+	Filename    string
+	ContentType string
+	Size        int64
+	Reader      io.ReadCloser
+}
+
+var (
+	logFilePath      = flag.String("l", "", "Path to the log file (leave empty to log to stdout)")
+	concurrencyLimit = flag.Int("c", 50, "Maximum number of concurrent requests")
+	timeout          = flag.Int("t", 30, "Timeout duration in seconds")
+)
+
+const DefaultContentType = "application/octet-stream"
+const TarContentType = "application/x-tar"
 
 // Helper function to get the filename from the Content-Disposition header
 func getFileName(resp *http.Response) string {
@@ -35,25 +50,48 @@ func getFileName(resp *http.Response) string {
 	return path.Base(resp.Request.URL.String())
 }
 
-func createTemp(resp *http.Response) (*os.File, error) {
+func getContentType(resp *http.Response) string {
+	ct := resp.Header.Get("Content-Type")
+	if ct != "" {
+		mediatype, _, err := mime.ParseMediaType(ct)
+		if err == nil {
+			return mediatype
+		}
+	}
+
+	name := getFileName(resp)
+	ext := path.Ext(name)
+	mimeExt := mime.TypeByExtension(ext)
+	if mimeExt != "" {
+		return mimeExt
+	}
+
+	return DefaultContentType
+}
+
+func createTemp(r io.ReadCloser) (*os.File, error) {
 	tempFile, err := os.CreateTemp("", "fss_*.tmp")
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err = io.Copy(tempFile, resp.Body); err != nil {
+	if _, err = io.Copy(tempFile, r); err != nil {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
 		return nil, err
 	}
 
-	if _, err := tempFile.Seek(0, 0); err != nil {
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
 		return nil, err
 	}
 
 	return tempFile, nil
-
 }
 
-func downloadFile(client *http.Client, url *url.URL) (*http.Response, error) {
+func doQuery(client *http.Client, url *url.URL) (*http.Response, error) {
 	url.RawQuery = url.Query().Encode()
 
 	req, err := http.NewRequest("GET", url.String(), nil)
@@ -84,7 +122,7 @@ func writeFile(writer io.Writer, file io.Reader) error {
 	return nil
 }
 
-func writeTar(tarWriter *tar.Writer, fileName string, file io.Reader, size int64) error {
+func writeTarFile(tarWriter *tar.Writer, fileName string, file io.Reader, size int64) error {
 	header := &tar.Header{
 		Name: fileName,
 		Size: size,
@@ -102,51 +140,104 @@ func writeTar(tarWriter *tar.Writer, fileName string, file io.Reader, size int64
 	return nil
 }
 
-func processFile(client *http.Client, url *url.URL, writer io.Writer, wg *sync.WaitGroup, mu *sync.Mutex) {
-	defer wg.Done()
-	resp, err := downloadFile(client, url)
+func processFile(writer io.Writer, fi FileInfo, wg *sync.WaitGroup) {
+	var err error
+	if tw, ok := writer.(*tar.Writer); ok {
+		err = writeTarFile(tw, fi.Filename, fi.Reader, fi.Size)
+	} else {
+		err = writeFile(writer, fi.Reader)
+	}
 
+	if err != nil {
+		log.Printf("failed to stream %s: %v", fi.Filename, err)
+	}
+
+	fi.Reader.Close()
+	wg.Done()
+}
+
+func processFiles(writer io.Writer, fiCh chan FileInfo, wg *sync.WaitGroup) {
+
+	for fi := range fiCh {
+		wg.Add(1)
+		processFile(writer, fi, wg)
+	}
+
+	wg.Done()
+}
+
+func processUrl(client *http.Client, rawUrl string, reqSize bool, wg *sync.WaitGroup, fiCh chan FileInfo, sem chan struct{}) {
+	sem <- struct{}{}
+	defer wg.Done()
+
+	url, err := url.Parse(rawUrl)
+	if err != nil {
+		log.Printf("error parsing URL: %s, %v", rawUrl, err)
+		return
+	}
+
+	resp, err := doQuery(client, url)
 	if err != nil {
 		log.Printf("%v", err)
 		return
 	}
 
-	defer resp.Body.Close()
 	fileName := getFileName(resp)
+	contentType := getContentType(resp)
 	size := resp.ContentLength
-	fileReader := resp.Body
 
-	if resp.ContentLength == -1 {
-		tempFile, err := createTemp(resp)
-
+	// If the caller requires the full size but the response is chunked, we first
+	// have to read all the chunks before sending it along to the file channel
+	var reader io.ReadCloser
+	if reqSize && size == -1 {
+		defer resp.Body.Close()
+		file, err := createTemp(resp.Body)
 		if err != nil {
-			log.Printf("failed to create temp file for %s: %v", url, err)
+			log.Printf("error creating temp file %v", err)
 			return
 		}
 
-		fileInfo, err := tempFile.Stat()
+		fileInfo, err := file.Stat()
 		if err != nil {
 			log.Printf("failed to get file info for %s: %v", url, err)
 			return
 		}
 
-		fileReader = tempFile
+		reader = file
 		size = fileInfo.Size()
+
+	} else {
+		pr, pw := io.Pipe()
+		reader = pr
+
+		go func() {
+			defer resp.Body.Close()
+			defer pw.Close()
+
+			if _, err := io.Copy(pw, resp.Body); err != nil {
+				log.Printf("error copying data: %v", err)
+			}
+
+		}()
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if tw, ok := writer.(*tar.Writer); ok {
-		err = writeTar(tw, fileName, fileReader, size)
-		if err != nil {
-			log.Printf("failed to stream %s to tar: %v", url, err)
-			return
-		}
-	} else {
-		err = writeFile(writer, fileReader)
-		if err != nil {
-			log.Printf("failed to stream %s to writer: %v", url, err)
-			return
+	fiCh <- FileInfo{
+		Filename:    fileName,
+		ContentType: contentType,
+		Size:        size,
+		Reader:      reader,
+	}
+
+	<-sem
+}
+
+func closeWriters(writers ...io.Writer) {
+	for _, writer := range writers {
+		if closer, ok := writer.(io.Closer); ok {
+			err := closer.Close()
+			if err != nil {
+				log.Printf("Error closing writer %v", err)
+			}
 		}
 	}
 }
@@ -157,16 +248,11 @@ func fetch(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Invalid URL list")
 	}
 
-	tarParam := c.QueryParam("tar")
-	writeTar, err := strconv.ParseBool(tarParam)
-	if err != nil {
-		writeTar = false
+	if len(urls) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "No URLs provided")
 	}
 
-	// If more than one URL is provided, write to a tar file
-	if len(urls) > 1 {
-		writeTar = true
-	}
+	writeTar := len(urls) > 1 || c.QueryParam("tar") == "true"
 
 	// Create a pipe to stream data back to the requester
 	pr, pw := io.Pipe()
@@ -177,43 +263,54 @@ func fetch(c echo.Context) error {
 		writer = tar.NewWriter(pw)
 	}
 
-	var mu sync.Mutex
-	wg := &sync.WaitGroup{}
+	rwg := &sync.WaitGroup{} // Wait for reads
+	wwg := &sync.WaitGroup{} // wait for writes
+
+	sem := make(chan struct{}, *concurrencyLimit) // Semaphore to limit concurrency
+	fiCh := make(chan FileInfo, min(len(urls), *concurrencyLimit))
+
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: time.Duration(*timeout) * time.Second,
 	}
 
-	for _, rawUrl := range urls {
-		url, err := url.Parse(rawUrl)
-		if err != nil {
-			log.Printf("Error parsing URL: %s, %v", rawUrl, err)
-			continue
-		}
-
-		wg.Add(1)
-		go processFile(client, url, writer, wg, &mu)
+	rwg.Add(len(urls))
+	for _, url := range urls {
+		go processUrl(client, url, writeTar, rwg, fiCh, sem)
 	}
 
-	// Close writers when all downloads are complete
+	wwg.Add(1)
+	var contentType string
+	var filename string
+
+	// If we are not writing to TAR we are only dealing with one file.
+	if !writeTar {
+		fi := <-fiCh
+		filename = fi.Filename
+		contentType = fi.ContentType
+		go processFile(writer, fi, wwg)
+	} else {
+		contentType = TarContentType
+		filename = fmt.Sprintf("fss-files-%s.tar", time.Now().Format("2006-01-02T15-04-05"))
+		go processFiles(writer, fiCh, wwg)
+	}
+
 	go func() {
-		wg.Wait()
-		// Close the writer if it is a tar writer
-		if closer, ok := writer.(io.Closer); ok {
-			err := closer.Close()
-			if err != nil {
-				log.Printf("Error closing writer %v", err)
-			}
-		}
-		pw.Close()
+		// All content has been pushed to the channel
+		rwg.Wait()
+		close(fiCh)
+
+		// Writers are done
+		wwg.Wait()
+		closeWriters(writer, pw)
+		pr.Close()
 	}()
 
-	return c.Stream(http.StatusOK, "application/x-tar", pr)
+	c.Response().Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	return c.Stream(http.StatusOK, contentType, pr)
+
 }
 
-func main() {
-	logFilePath := flag.String("logFile", "", "Path to the log file (leave empty to log to stdout)")
-	flag.Parse()
-
+func setupLog() {
 	var logOutput *os.File
 	var err error
 	if *logFilePath != "" {
@@ -228,6 +325,12 @@ func main() {
 	}
 
 	log.SetOutput(logOutput)
+}
+
+func main() {
+	flag.Parse()
+
+	setupLog()
 
 	e := echo.New()
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{

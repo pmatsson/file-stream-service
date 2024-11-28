@@ -1,4 +1,4 @@
-module fss
+module fss.go
 
 go 1.23.2
 
