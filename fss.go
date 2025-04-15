@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
@@ -11,11 +12,14 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type FileInfo struct {
@@ -29,10 +33,41 @@ var (
 	logFilePath      = flag.String("l", "", "Path to the log file (leave empty to log to stdout)")
 	concurrencyLimit = flag.Int("c", 50, "Maximum number of concurrent requests")
 	timeout          = flag.Int("t", 30, "Timeout duration in seconds")
+	usePrepare       = flag.Bool("p", false, "Allow prepare requests")
 )
 
 const DefaultContentType = "application/octet-stream"
 const TarContentType = "application/x-tar"
+
+// DB is a global variable for the SQLite database connection
+var DB *sql.DB
+
+func initDB() {
+	var err error
+	DB, err = sql.Open("sqlite3", "./fss.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sqlStmt := `
+		CREATE TABLE IF NOT EXISTS prepare (
+			id BLOB PRIMARY KEY,
+			tar BOOLEAN DEFAULT 1,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+		
+		CREATE TABLE IF NOT EXISTS prepare_urls (
+			prepare_id BLOB,
+			url TEXT NOT NULL,
+			PRIMARY KEY (prepare_id, url),
+			FOREIGN KEY (prepare_id) REFERENCES prepare(id) ON DELETE CASCADE
+    );`
+
+	_, err = DB.Exec(sqlStmt)
+	if err != nil {
+		log.Fatalf("Error creating table: %q: %s\n", err, sqlStmt)
+	}
+}
 
 // Helper function to get the filename from the Content-Disposition header
 func getFileName(resp *http.Response) string {
@@ -242,17 +277,57 @@ func closeWriters(writers ...io.Writer) {
 	}
 }
 
+func getParams(c echo.Context) (urls []string, tar bool, err error) {
+	rawId := c.Param("id")
+	if c.Request().Method == "GET" && rawId != "" {
+		id, err := uuid.Parse(rawId)
+		if err != nil {
+			return nil, false, echo.NewHTTPError(http.StatusBadRequest, "Invalid UUID format: "+rawId)
+		}
+
+		query := `
+			SELECT 
+				p.tar,
+				GROUP_CONCAT(u.url) AS urls
+			FROM 
+				prepare p
+			JOIN 
+				prepare_urls u ON p.id = u.prepare_id
+			WHERE 
+				p.id = ? 
+			GROUP BY 
+				p.id;`
+
+		var urlCs string // comma-separated list of URLs
+		err = DB.QueryRow(query, id[:]).Scan(&tar, &urlCs)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, false, echo.NewHTTPError(http.StatusNotFound, "Prepare ID not found")
+			}
+			return nil, false, echo.NewHTTPError(http.StatusInternalServerError, "Database error")
+		}
+
+		urls = strings.Split(urlCs, ",")
+	} else {
+		if err := c.Bind(&urls); err != nil {
+			return nil, false, echo.NewHTTPError(http.StatusBadRequest, "Invalid URL list")
+		}
+
+		if len(urls) == 0 {
+			return nil, false, echo.NewHTTPError(http.StatusBadRequest, "No URLs provided")
+		}
+
+		tar = len(urls) > 1 || c.QueryParam("tar") == "true"
+	}
+
+	return urls, tar, nil
+}
+
 func fetch(c echo.Context) error {
-	var urls []string
-	if err := c.Bind(&urls); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "Invalid URL list")
+	urls, writeTar, err := getParams(c)
+	if err != nil {
+		return err
 	}
-
-	if len(urls) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "No URLs provided")
-	}
-
-	writeTar := len(urls) > 1 || c.QueryParam("tar") == "true"
 
 	// Create a pipe to stream data back to the requester
 	pr, pw := io.Pipe()
@@ -310,11 +385,43 @@ func fetch(c echo.Context) error {
 
 }
 
+func prepare(c echo.Context) error {
+	urls, tar, err := getParams(c)
+	if err != nil {
+		return err
+	}
+
+	tx, err := DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to start transaction: %v", err)
+	}
+
+	id := uuid.New()
+	if _, err := tx.Exec(`INSERT INTO prepare(id, tar) VALUES(?, ?)`, id[:], tar); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("insert failed: %v", err)
+	}
+
+	for _, url := range urls {
+		if _, err := tx.Exec(`INSERT INTO prepare_urls(prepare_id, url) VALUES(?, ?)`, id[:], url); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("insert failed: %v", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit failed: %v", err)
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"id": id.String(),
+	})
+}
+
 func setupLog() {
 	var logOutput *os.File
 	var err error
 	if *logFilePath != "" {
-		// Open the log file for writing (create if doesn't exist)
 		logOutput, err = os.OpenFile(*logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			log.Fatalf("Error opening log file: %v", err)
@@ -329,7 +436,6 @@ func setupLog() {
 
 func main() {
 	flag.Parse()
-
 	setupLog()
 
 	e := echo.New()
@@ -337,6 +443,13 @@ func main() {
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{echo.GET, echo.POST, echo.PUT, echo.DELETE, echo.OPTIONS},
 	}))
+
+	if *usePrepare {
+		initDB()
+		e.POST("/prepare", prepare)
+		e.GET("/fetch/prepared/:id", fetch)
+	}
+
 	e.POST("/fetch", fetch)
 	e.Start(":5001")
 }
