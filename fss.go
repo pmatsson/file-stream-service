@@ -31,8 +31,8 @@ type FileInfo struct {
 
 var (
 	logFilePath      = flag.String("l", "", "Path to the log file (leave empty to log to stdout)")
-	concurrencyLimit = flag.Int("c", 50, "Maximum number of concurrent requests")
-	timeout          = flag.Int("t", 30, "Timeout duration in seconds")
+	concurrencyLimit = flag.Int("c", 4, "Maximum number of concurrent requests")
+	timeout          = flag.Duration("t", 30*time.Second, "Timeout duration (0 to disable timeout)")
 	usePrepare       = flag.Bool("p", false, "Allow prepare requests")
 )
 
@@ -345,7 +345,7 @@ func fetch(c echo.Context) error {
 	fiCh := make(chan FileInfo, min(len(urls), *concurrencyLimit))
 
 	client := &http.Client{
-		Timeout: time.Duration(*timeout) * time.Second,
+		Timeout: *timeout,
 	}
 
 	rwg.Add(len(urls))
@@ -393,24 +393,28 @@ func prepare(c echo.Context) error {
 
 	tx, err := DB.Begin()
 	if err != nil {
-		return fmt.Errorf("failed to start transaction: %v", err)
+		log.Printf("failed to start transaction: %v", err)
+		return echo.NewHTTPError(http.StatusInternalServerError)
 	}
 
 	id := uuid.New()
 	if _, err := tx.Exec(`INSERT INTO prepare(id, tar) VALUES(?, ?)`, id[:], tar); err != nil {
 		tx.Rollback()
-		return fmt.Errorf("insert failed: %v", err)
+		log.Printf("insert failed: %v", err)
+		return echo.NewHTTPError(http.StatusInternalServerError)
 	}
 
 	for _, url := range urls {
 		if _, err := tx.Exec(`INSERT INTO prepare_urls(prepare_id, url) VALUES(?, ?)`, id[:], url); err != nil {
 			tx.Rollback()
-			return fmt.Errorf("insert failed: %v", err)
+			log.Printf("insert failed: %v", err)
+			return echo.NewHTTPError(http.StatusInternalServerError)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit failed: %v", err)
+		log.Printf("commit failed: %v", err)
+		return echo.NewHTTPError(http.StatusInternalServerError)
 	}
 
 	return c.JSON(http.StatusOK, echo.Map{
