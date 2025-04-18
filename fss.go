@@ -39,6 +39,15 @@ type FileInfo struct {
 	Reader      io.ReadCloser
 }
 
+type DownloadResult struct {
+	URL         string
+	Success     bool
+	Error       string
+	Filename    string
+	ContentType string
+	Size        int64
+}
+
 type FSS struct {
 	config Config
 	db     *sql.DB
@@ -182,8 +191,13 @@ func (fss *FSS) fetchURL(ctx context.Context, client *http.Client, targetURL *ur
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		statusCode := resp.StatusCode
+		statusText := http.StatusText(statusCode)
+		if statusText == "" {
+			statusText = "Unknown Status"
+		}
 		resp.Body.Close()
-		return nil, fmt.Errorf("%w: %s: %s", ErrDownloadFailed, targetURL.String(), resp.Status)
+		return nil, fmt.Errorf("%w: HTTP %d %s - %s", ErrDownloadFailed, statusCode, statusText, targetURL.String())
 	}
 
 	return resp, nil
@@ -240,28 +254,154 @@ func (fss *FSS) processFilesSequentially(writer io.Writer, fiCh chan FileInfo, w
 	}
 }
 
-func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, rawUrl string, reqSize bool, wg *sync.WaitGroup, fiCh chan FileInfo, sem chan struct{}) {
+// generateReport creates a report file listing all failed URLs and reasons
+func (fss *FSS) generateReport(results []DownloadResult) (io.ReadCloser, int64) {
+	var reportBuilder strings.Builder
+
+	// Get current time
+	currentTime := time.Now().Format("2006-01-02 15:04:05")
+
+	// Build report header
+	reportBuilder.WriteString(fmt.Sprintf("Download Report - %s\n", currentTime))
+	reportBuilder.WriteString("===============================\n\n")
+
+	// Count statistics
+	successCount := 0
+	failureCount := 0
+
+	// Error types for summary
+	errorTypes := make(map[string]int)
+
+	// Process results
+	for _, result := range results {
+		if result.Success {
+			successCount++
+		} else {
+			failureCount++
+
+			// Extract error type
+			errorMsg := result.Error
+			errorType := "Unknown error"
+
+			// HTTP status error pattern: "HTTP 404 Not Found"
+			if strings.Contains(errorMsg, "HTTP ") {
+				parts := strings.Split(errorMsg, " - ")
+				if len(parts) > 0 {
+					statusParts := strings.Split(parts[0], ": ")
+					if len(statusParts) > 1 {
+						errorType = statusParts[1] // "HTTP 404 Not Found"
+					}
+				}
+			} else if strings.Contains(errorMsg, ":") {
+				// Generic error pattern
+				parts := strings.SplitN(errorMsg, ":", 2)
+				errorType = strings.TrimSpace(parts[0])
+			}
+
+			errorTypes[errorType]++
+		}
+	}
+
+	// Add summary section
+	reportBuilder.WriteString("SUMMARY\n")
+	reportBuilder.WriteString("-------\n")
+	reportBuilder.WriteString(fmt.Sprintf("Total URLs: %d\n", len(results)))
+	reportBuilder.WriteString(fmt.Sprintf("Successful: %d\n", successCount))
+	reportBuilder.WriteString(fmt.Sprintf("Failed: %d\n\n", failureCount))
+
+	// Add error type summary if failures exist
+	if failureCount > 0 {
+		reportBuilder.WriteString("ERROR TYPES\n")
+		reportBuilder.WriteString("-----------\n")
+		for errorType, count := range errorTypes {
+			reportBuilder.WriteString(fmt.Sprintf("- %s: %d\n", errorType, count))
+		}
+		reportBuilder.WriteString("\n")
+	}
+
+	// Add detailed failures section
+	if failureCount > 0 {
+		reportBuilder.WriteString("FAILED DOWNLOADS\n")
+		reportBuilder.WriteString("----------------\n")
+
+		for i, result := range results {
+			if !result.Success {
+				// Get base filename only
+				urlPath := result.URL
+				if strings.Contains(urlPath, "?") {
+					urlPath = strings.Split(urlPath, "?")[0]
+				}
+				filename := path.Base(urlPath)
+
+				// Format error message to be more readable
+				errorMsg := result.Error
+				if strings.Contains(errorMsg, "download failed: HTTP") {
+					// Extract the status code and text from HTTP errors
+					statusStart := strings.Index(errorMsg, "HTTP")
+					urlStart := strings.LastIndex(errorMsg, " - ")
+					if statusStart >= 0 && urlStart > statusStart {
+						statusInfo := errorMsg[statusStart:urlStart]
+						errorMsg = statusInfo
+					}
+				}
+
+				// Add numbered entry with concise details
+				reportBuilder.WriteString(fmt.Sprintf("%d. %s\n", i+1, filename))
+				reportBuilder.WriteString(fmt.Sprintf("   URL: %s\n", result.URL))
+				reportBuilder.WriteString(fmt.Sprintf("   Error: %s\n\n", errorMsg))
+			}
+		}
+	}
+
+	reportContent := reportBuilder.String()
+	size := int64(len(reportContent))
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		io.WriteString(pw, reportContent)
+	}()
+
+	return pr, size
+}
+
+// downloadAndQueueFile fetches a URL and sends the file info to the channel
+func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, rawUrl string, reqSize bool,
+	wg *sync.WaitGroup, fiCh chan FileInfo, resultCh chan<- DownloadResult, sem chan struct{}) {
 	sem <- struct{}{}
 	defer func() {
 		<-sem
 		wg.Done()
 	}()
 
+	result := DownloadResult{
+		URL:     rawUrl,
+		Success: false,
+	}
+
 	url, err := url.Parse(rawUrl)
 	if err != nil {
 		log.Printf("error parsing URL: %s, %v", rawUrl, err)
+		result.Error = fmt.Sprintf("Invalid URL format: %v", err)
+		resultCh <- result
 		return
 	}
 
 	resp, err := fss.fetchURL(ctx, client, url)
 	if err != nil {
 		log.Printf("%v", err)
+		result.Error = err.Error()
+		resultCh <- result
 		return
 	}
 
 	fileName := fss.extractFilenameFromResponse(resp)
 	contentType := fss.determineContentType(resp)
 	size := resp.ContentLength
+
+	result.Filename = fileName
+	result.ContentType = contentType
+	result.Size = size
 
 	// If the caller requires the full size but the response is chunked, we first
 	// have to read all the chunks before sending it along to the file channel
@@ -271,6 +411,8 @@ func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, r
 		if err != nil {
 			resp.Body.Close()
 			log.Printf("error creating temp file %v", err)
+			result.Error = fmt.Sprintf("Failed to create temporary file: %v", err)
+			resultCh <- result
 			return
 		}
 		resp.Body.Close() // Close the original response body
@@ -280,11 +422,14 @@ func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, r
 			file.Close()
 			os.Remove(file.Name())
 			log.Printf("failed to get file info for %s: %v", url, err)
+			result.Error = fmt.Sprintf("Failed to get file info: %v", err)
+			resultCh <- result
 			return
 		}
 
 		reader = file
 		size = fileInfo.Size()
+		result.Size = size
 	} else {
 		// For streaming, we'll handle the body in the goroutine
 		pr, pw := io.Pipe()
@@ -309,9 +454,13 @@ func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, r
 		Size:        size,
 		Reader:      reader,
 	}:
+		result.Success = true
+		resultCh <- result
 	case <-ctx.Done():
 		log.Printf("context cancelled while queuing file %s", fileName)
 		reader.Close()
+		result.Error = "Request timed out or was cancelled"
+		resultCh <- result
 		if reqSize && size == -1 {
 			// Body is already closed in this case
 		} else {
@@ -407,11 +556,13 @@ func (fss *FSS) HandleFetchRequest(c echo.Context) error {
 		writer = tar.NewWriter(pw)
 	}
 
-	rwg := &sync.WaitGroup{} // Wait for reads
-	wwg := &sync.WaitGroup{} // wait for writes
+	readWg := &sync.WaitGroup{}
+	writeWg := &sync.WaitGroup{}
+	resultWg := &sync.WaitGroup{}
 
 	sem := make(chan struct{}, fss.config.ConcurrencyLimit) // Semaphore to limit concurrency
 	fiCh := make(chan FileInfo, min(len(urls), fss.config.ConcurrencyLimit))
+	resultCh := make(chan DownloadResult, len(urls))
 
 	// Create a context that will be cancelled if the client disconnects
 	fetchCtx, cancel := context.WithCancel(ctx)
@@ -434,12 +585,25 @@ func (fss *FSS) HandleFetchRequest(c echo.Context) error {
 		Timeout: fss.config.Timeout,
 	}
 
-	rwg.Add(len(urls))
+	// Start download tasks
+	readWg.Add(len(urls))
 	for _, url := range urls {
-		go fss.downloadAndQueueFile(fetchCtx, client, url, writeTar, rwg, fiCh, sem)
+		go fss.downloadAndQueueFile(fetchCtx, client, url, writeTar, readWg, fiCh, resultCh, sem)
 	}
 
-	wwg.Add(1)
+	resultWg.Add(len(urls))
+	var downloadResults []DownloadResult
+	var resultsMutex sync.Mutex
+	go func() {
+		for result := range resultCh {
+			resultsMutex.Lock()
+			downloadResults = append(downloadResults, result)
+			resultsMutex.Unlock()
+			resultWg.Done() // Mark this result as processed
+		}
+	}()
+
+	writeWg.Add(1)
 	var contentType string
 	var filename string
 
@@ -452,23 +616,60 @@ func (fss *FSS) HandleFetchRequest(c echo.Context) error {
 			}
 			filename = fi.Filename
 			contentType = fi.ContentType
-			go fss.writeFileToOutput(writer, fi, wwg)
+			go fss.writeFileToOutput(writer, fi, writeWg)
 		case <-fetchCtx.Done():
 			return echo.NewHTTPError(http.StatusGatewayTimeout, "Request timed out")
 		}
 	} else {
 		contentType = TarContentType
 		filename = fmt.Sprintf("fss-files-%s.tar", time.Now().Format("2006-01-02T15-04-05"))
-		go fss.processFilesSequentially(writer, fiCh, wwg)
+		go fss.processFilesSequentially(writer, fiCh, writeWg)
 	}
 
 	go func() {
 		// All content has been pushed to the channel
-		rwg.Wait()
+		readWg.Wait()
 		close(fiCh)
 
-		// Writers are done
-		wwg.Wait()
+		// Wait for all files to be processed before we start handling the report
+		writeWg.Wait()
+
+		close(resultCh)
+		resultWg.Wait()
+
+		if writeTar {
+			resultsMutex.Lock()
+
+			// Ensure report includes all URLs by checking for missing results
+			if len(downloadResults) < len(urls) {
+				// Add entries for URLs that didn't get a result
+				urlMap := make(map[string]bool)
+				for _, result := range downloadResults {
+					urlMap[result.URL] = true
+				}
+
+				for _, url := range urls {
+					if !urlMap[url] {
+						// Add a synthetic result for this URL
+						downloadResults = append(downloadResults, DownloadResult{
+							URL:     url,
+							Success: false,
+							Error:   "No response received - request may have timed out",
+						})
+					}
+				}
+			}
+
+			reportReader, reportSize := fss.generateReport(downloadResults)
+			if tw, ok := writer.(*tar.Writer); ok {
+				if err := fss.addFileToTarArchive(tw, "_download_report.txt", reportReader, reportSize); err != nil {
+					log.Printf("Failed to add download report to tar: %v", err)
+				}
+			}
+			reportReader.Close()
+			resultsMutex.Unlock()
+		}
+
 		fss.closeAllWriters(writer, pw)
 		pr.Close()
 	}()
