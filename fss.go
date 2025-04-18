@@ -72,6 +72,19 @@ var (
 	usePrepare       = flag.Bool("p", false, "Allow prepare requests")
 )
 
+type tempFileReadCloser struct {
+	io.ReadCloser
+	OnClose func()
+}
+
+func (t *tempFileReadCloser) Close() error {
+	err := t.ReadCloser.Close()
+	if t.OnClose != nil {
+		t.OnClose()
+	}
+	return err
+}
+
 func NewFSS() *FSS {
 	config := Config{
 		LogFilePath:      *logFilePath,
@@ -229,28 +242,21 @@ func (fss *FSS) addFileToTarArchive(tarWriter *tar.Writer, fileName string, file
 	return nil
 }
 
-func (fss *FSS) writeFileToOutput(writer io.Writer, fi FileInfo, wg *sync.WaitGroup) {
-	defer wg.Done()
-	defer fi.Reader.Close()
-
-	var err error
-	if tw, ok := writer.(*tar.Writer); ok {
-		err = fss.addFileToTarArchive(tw, fi.Filename, fi.Reader, fi.Size)
-	} else {
-		err = fss.copyDataToWriter(writer, fi.Reader)
-	}
-
-	if err != nil {
-		log.Printf("failed to stream %s: %v", fi.Filename, err)
-	}
-}
-
 func (fss *FSS) processFilesSequentially(writer io.Writer, fiCh chan FileInfo, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for fi := range fiCh {
-		wg.Add(1)
-		fss.writeFileToOutput(writer, fi, wg)
+		var err error
+		if tw, ok := writer.(*tar.Writer); ok {
+			err = fss.addFileToTarArchive(tw, fi.Filename, fi.Reader, fi.Size)
+		} else {
+			err = fss.copyDataToWriter(writer, fi.Reader)
+		}
+		fi.Reader.Close()
+
+		if err != nil {
+			log.Printf("Failed to stream %s: %v", fi.Filename, err)
+		}
 	}
 }
 
@@ -305,7 +311,7 @@ func (fss *FSS) generateReport(results []DownloadResult) (io.ReadCloser, int64) 
 	// Add summary section
 	reportBuilder.WriteString("SUMMARY\n")
 	reportBuilder.WriteString("-------\n")
-	reportBuilder.WriteString(fmt.Sprintf("Total URLs: %d\n", len(results)))
+	reportBuilder.WriteString(fmt.Sprintf("Total files: %d\n", len(results)))
 	reportBuilder.WriteString(fmt.Sprintf("Successful: %d\n", successCount))
 	reportBuilder.WriteString(fmt.Sprintf("Failed: %d\n\n", failureCount))
 
@@ -403,10 +409,9 @@ func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, r
 	result.ContentType = contentType
 	result.Size = size
 
-	// If the caller requires the full size but the response is chunked, we first
-	// have to read all the chunks before sending it along to the file channel
+	// If size is unknown (-1) or large (> 10MB), save to temp file first
 	var reader io.ReadCloser
-	if reqSize && size == -1 {
+	if (reqSize && size == -1) || size > 10*1024*1024 {
 		file, err := fss.createTempFile(resp.Body)
 		if err != nil {
 			resp.Body.Close()
@@ -427,24 +432,19 @@ func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, r
 			return
 		}
 
-		reader = file
+		// Store the temp file path for cleanup
+		tempPath := file.Name()
+		reader = &tempFileReadCloser{
+			ReadCloser: file,
+			OnClose: func() {
+				os.Remove(tempPath)
+			},
+		}
 		size = fileInfo.Size()
 		result.Size = size
 	} else {
-		// For streaming, we'll handle the body in the goroutine
-		pr, pw := io.Pipe()
-		reader = pr
-
-		// We need to keep the response body open for the pipe writing goroutine
-		// Don't defer resp.Body.Close() here since we want the goroutine to control that
-		go func() {
-			defer pw.Close()
-			defer resp.Body.Close() // Close the body after we're done copying
-
-			if _, err := io.Copy(pw, resp.Body); err != nil {
-				log.Printf("error copying data: %v", err)
-			}
-		}()
+		// For streaming, we'll handle the body directly
+		reader = resp.Body
 	}
 
 	select {
@@ -461,12 +461,6 @@ func (fss *FSS) downloadAndQueueFile(ctx context.Context, client *http.Client, r
 		reader.Close()
 		result.Error = "Request timed out or was cancelled"
 		resultCh <- result
-		if reqSize && size == -1 {
-			// Body is already closed in this case
-		} else {
-			// Otherwise ensure we close it
-			resp.Body.Close()
-		}
 	}
 }
 
@@ -712,6 +706,22 @@ func (fss *FSS) HandlePrepareRequest(c echo.Context) error {
 	return c.JSON(http.StatusOK, echo.Map{
 		"id": id.String(),
 	})
+}
+
+func (fss *FSS) writeFileToOutput(writer io.Writer, fi FileInfo, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer fi.Reader.Close()
+
+	var err error
+	if tw, ok := writer.(*tar.Writer); ok {
+		err = fss.addFileToTarArchive(tw, fi.Filename, fi.Reader, fi.Size)
+	} else {
+		err = fss.copyDataToWriter(writer, fi.Reader)
+	}
+
+	if err != nil {
+		log.Printf("Failed to stream %s: %v", fi.Filename, err)
+	}
 }
 
 func setupLogging() {
